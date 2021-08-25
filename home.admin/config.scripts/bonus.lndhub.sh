@@ -1,133 +1,189 @@
-#!/bin/bash
+#! /usr/bin/env -S bash -ex
 
-redisVersion="6.0.9"
+################################################################################
+####################### WORK IN PROGRESS — DO NOT USE ##########################
+################################################################################
 
-sudo apt install -y tcl
+REDIS_DIR="/mnt/hdd/redis"
+REDIS_CONFIG="/etc/redis/redis.conf"
+REDIS_SYSTEMD="/etc/systemd/system/redis.service"
 
-cd /home/admin/download
-rm -rf /home/admin/download/*
-wget http://download.redis.io/releases/redis-${redisVersion}.tar.gz
-tar xzf redis-${redisVersion}.tar.gz
-cd redis-${redisVersion}/
-make && sudo make install
+LND_DIR="/home/admin/.lnd"
 
-sudo mkdir /mnt/hdd/redis
-sudo adduser --system --group --no-create-home redis
-sudo chown redis:redis /mnt/hdd/redis
-sudo chmod 770 /mnt/hdd/redis
-sudo mkdir /etc/redis
-sudo sed -i "s/^supervised .*/supervised systemd/g" redis.conf
-sudo sed -i "s/^dir .\//dir \/mnt\/hdd\/redis/g" redis.conf
-sudo cp redis.conf /etc/redis
+LNDHUB_DIR="/home/bitcoin/.lndhub" # TODO: do all of this on the HDD instead?
+LNDHUB_USR="bitcoin"
+LNDHUB_GRP="bitcoin"
+LNDHUB_PORT=3050
 
-sudo tee /etc/systemd/system/redis.service >/dev/null <<EOF
-[Unit]
-Description=Redis In-Memory Data Store
-After=network.target
+## get redis from apt
+sudo apt install -y redis-server
 
-[Service]
-User=redis
-Group=redis
-ExecStart=/usr/local/bin/redis-server /etc/redis/redis.conf
-ExecStop=/usr/local/bin/redis-cli shutdown
-Restart=always
+## create alternative redis directory on SSD
+sudo mkdir --mode=750 "${REDIS_DIR}"
+sudo chown redis:redis "${REDIS_DIR}"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+## tweak redis.conf to reflect new dir
+sudo sed -i \
+    "s|^supervised .*|supervised systemd|" \
+    "${REDIS_CONFIG}"
 
-sudo systemctl daemon-reload
-sudo systemctl start redis
-sudo systemctl status redis --no-pager
+sudo sed -i \
+    "s|^dir .*|dir ${REDIS_DIR}|" \
+    "${REDIS_CONFIG}"
 
-sudo systemctl enable redis
+## TODO: tweak remaining redis settings
 
-bash /home/admin/config.scripts/bonus.nodejs.sh on
+## add ${REDIS_DIR} to writable directories
+sudo sed -i \
+    "/^ReadOnlyDirectories=.*\$/a ReadWriteDirectories=-${REDIS_DIR}" \
+    "${REDIS_SYSTEMD}"
 
-sudo ufw allow 3050 comment 'allow LndHub'
-sudo ufw reload
+sudo systemctl enable --now redis.service
+sudo systemctl status redis.service --no-pager
 
-cd /home/admin/download/
-sudo git clone https://github.com/BlueWallet/LndHub
-cd /home/admin
-sudo mv /home/admin/download/LndHub /home/bitcoin/
-sudo mv /home/bitcoin/LndHub /home/bitcoin/.lndhub
-sudo cp /home/admin/.lnd/data/chain/bitcoin/mainnet/admin.macaroon /home/bitcoin/.lndhub/
-sudo cp /home/admin/.lnd/tls.cert /home/bitcoin/.lndhub/
-sudo chown -R bitcoin:bitcoin /home/bitcoin/.lndhub/
+## install node.js
+/home/admin/config.scripts/bonus.nodejs.sh on
 
+## get the LndHub code
+sudo -u "${LNDHUB_USR}" git clone \
+    "https://github.com/BlueWallet/LndHub" \
+    "${LNDHUB_DIR}"
+
+## copy cert and macaroon from lnd
+sudo install \
+    --owner="${LNDHUB_USR}" --group="${LNDHUB_GRP}" --mode=600 \
+    --target-directory="${LNDHUB_DIR}" \
+    "${LND_DIR}/data/chain/bitcoin/mainnet/admin.macaroon" \
+    "${LND_DIR}/tls.cert"
+
+# TODO: need to get actual credentials and URLencode them
 rpcuser=raspibolt
-rpcpassword=passowrd_b
+rpcpassword=password_b
 
-sudo -u bitcoin tee /home/bitcoin/.lndhub/config.js >/dev/null <<EOF
+## create a config for LndHub
+sudo -u "${LNDHUB_USR}" tee "${LNDHUB_DIR}/config.js" > /dev/null <<EOF
+# config.js (for LndHub)
+
 let config = {
-  enableUpdateDescribeGraph: false,
-  postRateLimit: 100,
-  rateLimit: 200,
+  //enableUpdateDescribeGraph: false,
+  //postRateLimit: 100,
+  //rateLimit: 200,
   bitcoind: {
-    rpc: 'http://${rpcuser}:${rpcpassword}@$127.0.0.1:8332/wallet/wallet.dat',
+    rpc: 'http://${rpcuser}:${rpcpassword}@127.0.0.1:8332',
   },
   redis: {
     port: 6379,
     host: '127.0.0.1',
     family: 4,
+    //password: 'NOT USED',
     db: 0,
   },
   lnd: {
     url: '127.0.0.1:10009',
-    password: '',
+    //password: '',
   },
 };
 
 if (process.env.CONFIG) {
-  console.log('using config from env');
+  console.log('Using LndHub config from env ...');
   config = JSON.parse(process.env.CONFIG);
 }
 
 module.exports = config;
 EOF
 
-sudo npm config set prefix '/home/bitcoin/.npm-global'
-export PATH=/home/bitcoin/.npm-global/bin:$PATH
-sudo npm install
+## prepare the LndHub user's node installation and update $PATH
+sudo -iu "${LNDHUB_USR}" npm config set prefix "/home/${LNDHUB_USR}/.npm-global/"
 
-cd /home/bitcoin/.lndhub
-npm install @babel/cli -g
-npm install @babel/core -g
-sudo -u bitcoin mkdir /home/bitcoin/.lndhub/build
-sudo -u bitcoin sed -i "s/^let server = app.listen(process.env.PORT || 3000.*/let server = app.listen\(process.env.PORT || 3050, function () {/g" /home/bitcoin/.lndhub/index.js
-sudo -u bitcoin sed -i "s/^  logger.log('BOOTING UP', 'Listening on port ' + (process.env.PORT || 3000));/  logger.log('BOOTING UP', 'Listening on port ' + (process.env.PORT || 3050));/g" /home/bitcoin/.lndhub/index.js
-npm run babel ./ --out-dir ./build --copy-files --ignore node_modules
-cd /home/admin
+echo "if [ -d \"\${HOME}/.npm-global/bin\" ]; then
+    PATH=\"\${HOME}/.npm-global/bin:\${PATH}\"
+fi" | sudo -iu "${LNDHUB_USR}" tee -a "/home/${LNDHUB_USR}/.bashrc"
 
-sudo node /home/bitcoin/.lndhub/build/index.js
+## build LndHub and its dependencies
+sudo -u "${LNDHUB_USR}" \
+    bash -ic "(cd \'${LNDHUB_DIR}\' && npm i && npm i -g @babel/cli @babel/core && mkdir build)"
+sudo -u "${LNDHUB_USR}" \
+    bash -ic "(cd \'${LNDHUB_DIR}\' && babel ./ --out-dir ./build --copy-files --ignore node_modules)"
 
-sudo tee /etc/systemd/system/lndhub.service >/dev/null <<EOF
+## create hardened systemd unit file for LndHub
+sudo tee /etc/systemd/system/lndhub.service > /dev/null <<EOF
+# systemd unit for LndHub
+# /etc/systemd/system/lndhub.service
+
 [Unit]
+
 Description=LndHub Wrapper for Lightning Daemon
-Wants=lnd.service
-After=lnd.service
+After=lnd.service bitcoind.service tor.service
+Wants=lnd.service tor.service
+
 
 [Service]
-WorkingDirectory=/home/bitcoin/.lndhub
+
+# Service execution
+###################
+
+Environment="PORT=${LNDHUB_PORT}"
+WorkingDirectory=${LNDHUB_DIR}
 ExecStart=/usr/bin/node build/index.js
+
+
+# Process management
+####################
+
+Type=simple
+KillMode=process
+Restart=always
+RestartSec=15
+TimeoutSec=45
+
+
+# Process priority
+##################
+
+LimitNOFILE=128000
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+
+# Directory creation and permissions
+####################################
 
 User=bitcoin
 Group=bitcoin
-Type=simple
-KillMode=process
-LimitNOFILE=128000
-TimeoutSec=240
-Restart=always
-RestartSec=60
+
+# /run/bitcoind
+RuntimeDirectory=lndhub
+RuntimeDirectoryMode=0710
+
+
+# Hardening measures
+####################
+
+# Provide a private /tmp and /var/tmp
+PrivateTmp=true
+
+# Mount /usr, /boot/ and /etc read-only for the process
+ProtectSystem=full
+
+# TODO: Deny access to /home, /root and /run/user
+ProtectHome=false
+
+# Disallow the process and all of its children to gain
+# new privileges through execve()
+NoNewPrivileges=true
+
+# Use a new /dev namespace only populated with API pseudo devices
+# such as /dev/null, /dev/zero and /dev/random
+PrivateDevices=true
+
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable lndhub
-sudo systemctl start lndhub
+## allow LndHub port in ufw and start service
+sudo ufw allow "${LNDHUB_PORT}/tcp" comment "allow LndHub"
+sudo systemctl enable --now lndhub.service
 
-echo
-echo "DONE"
+echo -en "\nDONE\n"
